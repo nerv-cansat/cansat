@@ -252,6 +252,9 @@ int read_humidity(){
 }
 
 void loop() {
+  while((analogRead(A2)*0.841)<620){ //voltage protection, low voltage halts the program at this point
+
+  }
   double T, P;
   float temp;
   Serial.write(co2_hex, 8);
