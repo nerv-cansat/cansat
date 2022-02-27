@@ -6,7 +6,7 @@ using namespace CanSatKit;
 // set radio receiver parameters - see comments below
 // remember to set the same radio parameters in
 // transmitter and receiver boards!
-Radio radio(Pins::Radio::ChipSelect,
+Radio radio(Pins::Radio::ChipSelect, //pierdoli
             Pins::Radio::DIO0,
             433.0,                  // frequency in MHz
             Bandwidth_125000_Hz,    // bandwidth - check with CanSat regulations to set allowed value
@@ -26,13 +26,12 @@ void loop() {
   // 255 + 1 byte = 256 bytes
   char data[256];
 
-  // receive data and save it to string
   radio.receive(data);
   DynamicJsonDocument recv(512);
   deserializeJson(recv, data);
   int rssi = radio.get_rssi_last();
   recv["rssi"] = rssi;
-  
   serializeJson(recv, SerialUSB);
   SerialUSB.print("\n");
+
 }

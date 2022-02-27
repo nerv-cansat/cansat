@@ -3,33 +3,34 @@
 #include <CanSatKit.h>
 #include <SD.h>
 #include <Wire.h>
-#include <DS1307.h>
 #include <OneWire.h> 
 #include <DallasTemperature.h>
 #include <VL53L1X.h>
 #include <LSM6.h>
 #include <LIS3MDL.h>
 #include <Adafruit_AHTX0.h>
+#include "RTClib.h"
+#include <Servo.h>
+#include <SPS30.h>
+
+
 
 using namespace CanSatKit;
 
 #define LED_BUZZ 9
 #define GAS A0
 #define ONE_WIRE_BUS 2 
-#define PM25_MIN_VOLTAGE     600 
-#define PM25_VREF           3300 
-#define PM25_PIN_LED           8 
-#define PM25_PIN_ANALOG        A4
-#define PM25_MAX_ITERS        10 
+
 OneWire oneWire(ONE_WIRE_BUS); 
 DallasTemperature dallas_temp(&oneWire);
-DS1307 clock;
-RTCDateTime dt;
+RTC_DS3231 rtc;
 BMP280 bmp;
 VL53L1X tof;
 LIS3MDL mag;
 LSM6 imu;
 Adafruit_AHTX0 aht;
+Servo motor;
+SPS30 PM25;
 Radio radio(Pins::Radio::ChipSelect,
             Pins::Radio::DIO0,
             433.0,
@@ -37,6 +38,11 @@ Radio radio(Pins::Radio::ChipSelect,
             SpreadingFactor_9,
             CodingRate_4_8);
 
+uint32_t armTime = 0;
+bool armed = false;
+
+
+int ledCounter = 0;
 int ADC_VALUE;
 int ITER; 
 float VOLTAGE; 
@@ -64,7 +70,6 @@ String parseCO2(){
 }
 
 void tof_init(){
-  Wire.begin();
   tof.setTimeout(500);
   if (!tof.init())
   {
@@ -76,73 +81,35 @@ void tof_init(){
   tof.startContinuous(50);
 }
 
-float average (int * array, int len) 
-{
-  long sum = 0L ;  
-  for (int i = 0 ; i < len ; i++)
-    sum += array [i] ;
-  return  ((float) sum) / len ;
-}
-
-
-float tof_measure(){
-  lastRead[pos] = tof.read();
-  pos++;
-  if(pos>9){
-      pos = 0;
-      saturated = true;
-  }
-  delay(10);
-  if (tof.timeoutOccurred()) { SerialUSB.print(" TIMEOUT"); }
-   return(average(lastRead,10));
-}
-
-float computeDust() {
-  digitalWrite(PM25_PIN_LED, HIGH);
-  delayMicroseconds(280);
-  ADC_VALUE = analogRead(PM25_PIN_ANALOG);
-  digitalWrite(PM25_PIN_LED, LOW);
-  VOLTAGE = (PM25_VREF / 1024.0) * ADC_VALUE * 11;
-  if (VOLTAGE > PM25_MIN_VOLTAGE)
+float get_rtc_volt(){
+  unsigned int data[2];
+  Wire.beginTransmission(0x54);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  Wire.requestFrom(0x54, 2);
+  if(Wire.available() == 2)
   {
-    return (VOLTAGE - PM25_MIN_VOLTAGE) * 0.2;
+    data[0] = Wire.read();
+    data[1] = Wire.read();
   }
- 
-  return 0;
-}
-
-float iterateDust(){
-   AVG_DUST = 0;
-   ITER = 0;
- 
-   while (ITER < PM25_MAX_ITERS)
-   {
-     DUST = computeDust();
-     if (DUST > 0)
-     {
-       AVG_DUST += DUST;
-       ITER++;
-       delay(50);
-     }     
-   }
-   
-   AVG_DUST /= PM25_MAX_ITERS;
-   return AVG_DUST;
-   
+  int raw_adc = ((data[0] & 0x0F) * 256) + data[1];
+  float volt = (raw_adc/4096.00)*3.30;
+  return volt;
 }
 
 
-void transmit(float T, double P, int distance, int co2, int humidity, float dust) {
+void transmit(float T, double P, int distance, int co2, int humidity, float dust[4]) {
   Frame buff1;
   DynamicJsonDocument radio_1(254);
   DynamicJsonDocument radio_2(254);
-  dt = clock.getDateTime();
-  String date = String(dt.year)+"-"+String(dt.month)+"-"+String(dt.day)+"-"+String(dt.hour)+"-"+String(dt.minute)+"-"+String(dt.second);
-  int voltage = (analogRead(A2)*0.841); //x100
+  DynamicJsonDocument radio_3(254);
+  DateTime dt = rtc.now();
+  String date = String(dt.year())+"-"+String(dt.month())+"-"+String(dt.day())+"-"+String(dt.hour())+"-"+String(dt.minute())+"-"+String(dt.second());
+  int voltage = (analogRead(A2)*0.983); //x100
   int gas = (analogRead(GAS)*0.97);
   int temp = T*100;
   int pressure = P*100;  
-  int pm25 = dust*100;
+  
   radio_1["time"] = date; 
   radio_1["t"] = temp; //x100
   radio_1["p"] = pressure; //x100
@@ -151,7 +118,6 @@ void transmit(float T, double P, int distance, int co2, int humidity, float dust
   radio_1["co2"] = co2;
   radio_1["h"] = humidity; //x100 z poziomu funkcji read
   radio_1["g"] = gas; //x100
-  radio_1["p25"] = pm25; //x100
   
 
   int acc_x = (((imu.a.x) * 0.000061)*981.0); //x100
@@ -161,6 +127,8 @@ void transmit(float T, double P, int distance, int co2, int humidity, float dust
   int gyro_x = ((imu.g.x) * 0.7476); //x100
   int gyro_y = ((imu.g.y) * 0.7476); //x100
   int gyro_z = ((imu.g.z) * 0.7476); //x100
+
+  int clockVoltage = get_rtc_volt()*100;
   
   radio_2["acc"]["x"] = acc_x;
   radio_2["acc"]["y"] = acc_y;
@@ -169,7 +137,10 @@ void transmit(float T, double P, int distance, int co2, int humidity, float dust
   radio_2["gyro"]["x"] = gyro_x;
   radio_2["gyro"]["y"] = gyro_y;
   radio_2["gyro"]["z"] = gyro_z;
+
+  radio_2["rtc"] = clockVoltage;
   
+
   serializeJson(radio_1, buff1);
   radio.transmit(buff1);
 
@@ -196,26 +167,57 @@ void transmit(float T, double P, int distance, int co2, int humidity, float dust
   }
 
   buff1.clear();
+  int particles[4];
+  for(int i = 0; i<4; i++){
+    particles[i] = dust[i]*100;
+  }
+  radio_3["t"] = temp;
+  radio_3["p"] = pressure;
+  radio_3["pm"]["1"] = particles[0];
+  radio_3["pm"]["25"] = particles[1];  
+  radio_3["pm"]["40"] = particles[2];
+  radio_3["pm"]["10"] = particles[3];
+
+  serializeJson(radio_3, buff1);
+  radio.transmit(buff1);
+
+  dataFile = SD.open("json.txt", FILE_WRITE);
+  if (dataFile) {
+    dataFile.println(buff1);
+    dataFile.close();
+  }
+  else {
+    SerialUSB.println("sd nie ma pliku");
+  }
+  buff1.clear();
+
+  radio.flush();
 }
 
 
 void setup() {
   SerialUSB.begin(9600);
   Serial.begin(9600); //co2
+  Wire.begin();
   pinMode(GAS, INPUT);
   pinMode(A2, INPUT);
   pinMode(LED_BUZZ, OUTPUT);
-  pinMode(PM25_PIN_LED, OUTPUT);
-  digitalWrite(PM25_PIN_LED, LOW);
   digitalWrite(LED_BUZZ, HIGH);
-  clock.begin();
-  //for setting the current date vvvvv
- // clock.setDateTime(__DATE__, __TIME__);
   SD.begin(11);
   dallas_temp.begin(); 
   radio.begin();
   radio.disable_debug();
   tof_init();
+  PM25.begin();
+  PM25.beginMeasuring();
+  if (! rtc.begin()) {
+    SerialUSB.println("Couldn't find RTC");
+  }
+  if (rtc.lostPower()) {
+    SerialUSB.println("RTC lost power, let's set the time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));   
+  }
+  rtc.disable32K();
   if (! aht.begin()) {
     SerialUSB.println("Could not find AHT? Check wiring");
   }
@@ -230,9 +232,11 @@ void setup() {
   }
   imu.enableDefault();
   mag.enableDefault();
+  motor.attach(4);
   bmp.setOversampling(16);
   delay(500);
   digitalWrite(LED_BUZZ, LOW);
+  motor.writeMicroseconds(1000);
 }
 
 
@@ -251,19 +255,61 @@ int read_humidity(){
   return humidity.relative_humidity*100;
 }
 
+void motorBraking(){
+  for(int i = 1; i<11; i++){
+    motor.writeMicroseconds((1000+i*100));
+    delay(200);
+  }
+  delay(1000);
+  motor.writeMicroseconds(1000);
+  armed = false;
+}
+
+
 void loop() {
-  while((analogRead(A2)*0.841)<620){ //voltage protection, low voltage halts the program at this point
+  uint32_t now = rtc.now().unixtime();
+  while((analogRead(A2)*0.983)<620){ //voltage protection, low voltage halts the program at this point
 
   }
+  int distance = tof.read();
+  if((distance >= 3000) && armTime==0){
+    armTime = now;
+  }
+  else if (distance<3000){
+    armTime=0;
+  }
+
+  if(armTime!=0 && ((now-armTime)>180)){
+    armed = true;
+    armTime = 0;
+    for(int i = 0; i<10; i++){
+        digitalWrite(LED_BUZZ, HIGH);
+        delay(50);
+        digitalWrite(LED_BUZZ, LOW);
+        delay(50);
+    } 
+  }
+
+
+  if((distance<2000) && armed) motorBraking();
+  
+  ledCounter++;
   double T, P;
   float temp;
+  float mass_concen[4];
+  if(PM25.dataAvailable()) PM25.getMass(mass_concen);
   Serial.write(co2_hex, 8);
-  int distance = tof.read();
   bmp.measureTemperatureAndPressure(T, P);
   imu.read();
   dallas_temp.requestTemperatures();
   temp = dallas_temp.getTempCByIndex(0);
-  co2_measure();
-  transmit(temp, P, distance, co2_level, read_humidity(), iterateDust());  
+  co2_measure();  
+  transmit(temp, P, distance, co2_level, read_humidity(), mass_concen);  
+  if(ledCounter>200){
+    digitalWrite(LED_BUZZ,HIGH);
+    ledCounter = 0;
+  }
   delay(700);
+  digitalWrite(LED_BUZZ,LOW);
+  
 }
